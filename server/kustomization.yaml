@@ -8,18 +8,8 @@ resources:
   - k8s/service.yaml
   - k8s/ingress.yaml
 
+# No secrets here. The Google client ID and secret are entered in the Obsidian plugin settings.
 configMapGenerator:
   - name: obsidian-auth-code
     files:
       - server.js
-  - name: obsidian-auth-config
-    literals:
-      - PUBLIC_URL=https://obsidian-sync.jericogustin.com
-
-# Create secret.env next to this file (it is gitignored):
-#   CLIENT_ID=...apps.googleusercontent.com
-#   CLIENT_SECRET=...
-secretGenerator:
-  - name: obsidian-auth-google
-    envs:
-      - secret.env

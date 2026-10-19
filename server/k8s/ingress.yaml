@@ -1,19 +1,15 @@
+# Standard Ingress, so it works on any cluster with an ingress controller.
+# Replace `relay.example.com` with your own hostname in an overlay (see README).
+# ingressClassName is Traefik, the k3s default. Change it for other controllers.
+# TLS is not set here: terminate HTTPS at your edge (a CDN/tunnel or cert-manager). Google requires HTTPS.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: obsidian-auth
-  annotations:
-    # Uses cert-manager for HTTPS. Google requires HTTPS for the callback.
-    # Change the issuer name if yours is different.
-    cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
   ingressClassName: traefik
-  tls:
-    - hosts:
-        - obsidian-sync.jericogustin.com
-      secretName: obsidian-auth-tls
   rules:
-    - host: obsidian-sync.jericogustin.com
+    - host: relay.example.com
       http:
         paths:
           - path: /

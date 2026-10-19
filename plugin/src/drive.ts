@@ -9,9 +9,27 @@ const SIMPLE_UPLOAD_LIMIT = 5 * 1024 * 1024;
 
 export interface RemoteFile {
   id: string;
-  /** The vault path. We store the full path as the Drive file name. */
   name: string;
   md5Checksum: string;
+  modifiedTime: string;
+}
+
+/** A file found in the vault folder, with its place in the folder tree worked out. */
+export interface TreeFile extends RemoteFile {
+  /** Vault path, such as `Notes/today.md`. */
+  path: string;
+  /** Drive folder that holds the file right now. */
+  parentId: string;
+  /** Uploaded by an older version that stored the full path as the file name, all in one folder. */
+  legacy: boolean;
+}
+
+interface RawItem {
+  id: string;
+  name: string;
+  mimeType: string;
+  parents?: string[];
+  md5Checksum?: string;
   modifiedTime: string;
 }
 
@@ -81,20 +99,78 @@ export class Drive {
     return res.status === 200 && !res.json.trashed;
   }
 
-  async listFiles(folderId: string): Promise<RemoteFile[]> {
-    const q = `${quote(folderId)} in parents and trashed=false and mimeType!='${FOLDER_MIME}'`;
-    const fields = "nextPageToken,files(id,name,md5Checksum,modifiedTime)";
-    const out: RemoteFile[] = [];
+  /**
+   * Lists everything under the vault folder, however deep.
+   * With the drive.file scope Drive only shows files this app made, so one paged listing is enough.
+   * Each item's vault path is worked out by walking up its parents to the vault folder.
+   */
+  async listTree(rootId: string): Promise<{ files: TreeFile[]; folders: Map<string, string> }> {
+    const fields = "nextPageToken,files(id,name,mimeType,parents,md5Checksum,modifiedTime)";
+    const items = new Map<string, RawItem>();
     let pageToken = "";
     do {
       const url =
-        `${API}/files?q=${encodeURIComponent(q)}&fields=${encodeURIComponent(fields)}&pageSize=1000` +
+        `${API}/files?q=${encodeURIComponent("trashed=false")}&fields=${encodeURIComponent(fields)}&pageSize=1000` +
         (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
       const res = await this.call({ url });
-      out.push(...(res.json.files ?? []));
+      for (const item of (res.json.files ?? []) as RawItem[]) items.set(item.id, item);
       pageToken = res.json.nextPageToken ?? "";
     } while (pageToken);
-    return out;
+
+    // null means "not inside the vault folder" (another vault's folder, or loose in Drive).
+    const paths = new Map<string, string | null>();
+    const resolve = (id: string): string | null => {
+      if (id === rootId) return "";
+      if (paths.has(id)) return paths.get(id) ?? null;
+      paths.set(id, null); // Stops a loop if Drive ever hands us a cycle.
+      const item = items.get(id);
+      const parent = item?.parents?.[0];
+      let path: string | null = null;
+      if (item && parent) {
+        const up = resolve(parent);
+        if (up !== null) path = up ? `${up}/${item.name}` : item.name;
+      }
+      paths.set(id, path);
+      return path;
+    };
+
+    const folders = new Map<string, string>([["", rootId]]);
+    const files: TreeFile[] = [];
+    for (const item of items.values()) {
+      if (item.id === rootId) continue;
+      const path = resolve(item.id);
+      if (path === null) continue;
+      if (item.mimeType === FOLDER_MIME) {
+        if (!folders.has(path)) folders.set(path, item.id);
+        continue;
+      }
+      files.push({
+        id: item.id,
+        name: item.name,
+        md5Checksum: item.md5Checksum ?? "",
+        modifiedTime: item.modifiedTime,
+        path,
+        parentId: item.parents?.[0] ?? rootId,
+        legacy: item.name.includes("/"),
+      });
+    }
+    return { files, folders };
+  }
+
+  /** Returns the Drive folder for a vault folder path, creating any missing levels. */
+  async ensureFolderPath(path: string, folders: Map<string, string>): Promise<string> {
+    const known = folders.get(path);
+    if (known) return known;
+    const slash = path.lastIndexOf("/");
+    const parentId = await this.ensureFolderPath(slash < 0 ? "" : path.slice(0, slash), folders);
+    const res = await this.call({
+      url: `${API}/files?fields=id`,
+      method: "POST",
+      contentType: "application/json",
+      body: JSON.stringify({ name: path.slice(slash + 1), mimeType: FOLDER_MIME, parents: [parentId] }),
+    });
+    folders.set(path, res.json.id);
+    return res.json.id;
   }
 
   async download(id: string): Promise<ArrayBuffer> {
@@ -102,12 +178,24 @@ export class Drive {
     return res.arrayBuffer;
   }
 
-  async create(folderId: string, path: string, data: ArrayBuffer): Promise<RemoteFile> {
-    return this.upload("POST", `${UPLOAD}/files`, { name: path, parents: [folderId] }, data);
+  async create(parentId: string, name: string, data: ArrayBuffer): Promise<RemoteFile> {
+    return this.upload("POST", `${UPLOAD}/files`, { name, parents: [parentId] }, data);
   }
 
   async update(id: string, data: ArrayBuffer): Promise<RemoteFile> {
     return this.upload("PATCH", `${UPLOAD}/files/${id}`, {}, data);
+  }
+
+  /** Moves a file into another folder and renames it, without re-uploading it. */
+  async move(id: string, name: string, fromParentId: string, toParentId: string): Promise<void> {
+    await this.call({
+      url:
+        `${API}/files/${id}?fields=id&addParents=${encodeURIComponent(toParentId)}` +
+        `&removeParents=${encodeURIComponent(fromParentId)}`,
+      method: "PATCH",
+      contentType: "application/json",
+      body: JSON.stringify({ name }),
+    });
   }
 
   private async upload(method: "POST" | "PATCH", base: string, meta: object, data: ArrayBuffer): Promise<RemoteFile> {

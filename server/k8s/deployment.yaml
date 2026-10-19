@@ -22,11 +22,6 @@ spec:
           command: ["node", "/app/server.js"]
           ports:
             - containerPort: 8080
-          envFrom:
-            - configMapRef:
-                name: obsidian-auth-config
-            - secretRef:
-                name: obsidian-auth-google
           volumeMounts:
             - name: code
               mountPath: /app

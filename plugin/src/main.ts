@@ -1,36 +1,45 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import {
   PROTOCOL_ACTION,
+  OAuthClient,
   PendingLogin,
   createLogin,
   exchangeCode,
+  parseSignInLink,
   refreshAccessToken,
   revoke,
 } from "./auth";
 import { Drive } from "./drive";
 import { SyncState, Syncer } from "./sync";
 
-// Your auth server on k3s.
-const DEFAULT_SERVER_URL = "https://obsidian-sync.jericogustin.com";
+// Where you deployed the relay (serves /callback), e.g. https://relay.example.com.
+// No default: each user sets their own in the settings. Google itself is called directly from the plugin.
+const DEFAULT_SERVER_URL = "";
 
 interface Settings {
   serverUrl: string;
+  clientId: string;
+  clientSecret: string;
   refreshToken: string;
   pendingLogin: PendingLogin | null;
   folderId: string;
   autoSyncMinutes: number;
   lastSync: number;
   syncState: SyncState;
+  lastSignInNote: string;
 }
 
 const DEFAULTS: Settings = {
   serverUrl: DEFAULT_SERVER_URL,
+  clientId: "",
+  clientSecret: "",
   refreshToken: "",
   pendingLogin: null,
   folderId: "",
   autoSyncMinutes: 5,
   lastSync: 0,
   syncState: {},
+  lastSignInNote: "",
 };
 
 export default class GDriveSyncPlugin extends Plugin {
@@ -73,12 +82,26 @@ export default class GDriveSyncPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  /** Saves a short sign-in status in data.json. Never store codes, states or secrets here. */
+  async noteSignIn(note: string) {
+    this.settings.lastSignInNote = `${new Date().toISOString()} ${note}`;
+    await this.saveSettings();
+  }
+
   isSignedIn(): boolean {
     return !!this.settings.refreshToken;
   }
 
   private serverUrl(): string {
     return this.settings.serverUrl.replace(/\/+$/, "");
+  }
+
+  private oauthClient(): OAuthClient {
+    return {
+      clientId: this.settings.clientId.trim(),
+      clientSecret: this.settings.clientSecret.trim(),
+      redirectUri: `${this.serverUrl()}/callback`,
+    };
   }
 
   resetTimer() {
@@ -111,14 +134,41 @@ export default class GDriveSyncPlugin extends Plugin {
   // ---------- Sign in ----------
 
   async startLogin() {
-    const { url, pending } = await createLogin(this.serverUrl());
+    if (!this.serverUrl() || !this.settings.clientId.trim() || !this.settings.clientSecret.trim()) {
+      new Notice("Enter your relay URL, Google client ID and client secret in the settings first.");
+      return;
+    }
+    const { url, pending } = await createLogin(this.oauthClient());
     this.settings.pendingLogin = pending;
     await this.saveSettings();
+    await this.noteSignIn("sign-in started, browser opened");
     window.open(url);
+  }
+
+  /** Fallback for browsers that don't hand the obsidian:// link to Obsidian. */
+  async finishLoginFromLink(link: string) {
+    const params = parseSignInLink(link);
+    if (!params) {
+      new Notice("That doesn't look like a sign-in link. Copy it from the sign-in page and try again.");
+      return;
+    }
+    await this.finishLogin(params);
   }
 
   private async finishLogin(params: Record<string, string>) {
     const pending = this.settings.pendingLogin;
+    // Diagnostics only: never log the code or the state values themselves.
+    console.debug("[gdrive-sync] sign-in callback", {
+      hasCode: !!params.code,
+      hasState: !!params.state,
+      error: params.error ?? null,
+      hasPendingLogin: !!pending,
+      stateMatches: !!pending && params.state === pending.state,
+    });
+    await this.noteSignIn(
+      `callback received: code=${!!params.code}, state=${!!params.state}, error=${params.error ?? "none"}, ` +
+        `pending=${!!pending}, stateMatches=${!!pending && params.state === pending.state}`,
+    );
     if (params.error) {
       new Notice(`Google sign-in failed: ${params.error}`);
       return;
@@ -128,7 +178,7 @@ export default class GDriveSyncPlugin extends Plugin {
       return;
     }
     try {
-      const tokens = await exchangeCode(this.serverUrl(), params.code, pending.verifier);
+      const tokens = await exchangeCode(this.oauthClient(), params.code, pending.verifier);
       if (!tokens.refreshToken) throw new Error("Google did not return a refresh token");
       this.settings.refreshToken = tokens.refreshToken;
       this.settings.pendingLogin = null;
@@ -140,6 +190,8 @@ export default class GDriveSyncPlugin extends Plugin {
       this.updateStatus();
       this.sync();
     } catch (err) {
+      console.error("[gdrive-sync] sign-in failed:", (err as Error).message);
+      await this.noteSignIn(`token exchange failed: ${(err as Error).message}`);
       new Notice(`Google sign-in failed: ${(err as Error).message}`);
     }
   }
@@ -160,7 +212,7 @@ export default class GDriveSyncPlugin extends Plugin {
   private async getAccessToken(): Promise<string> {
     if (this.accessToken && Date.now() < this.accessTokenExpiresAt - 60_000) return this.accessToken;
     if (!this.settings.refreshToken) throw new Error("Not signed in");
-    const tokens = await refreshAccessToken(this.serverUrl(), this.settings.refreshToken);
+    const tokens = await refreshAccessToken(this.oauthClient(), this.settings.refreshToken);
     this.accessToken = tokens.accessToken;
     this.accessTokenExpiresAt = tokens.expiresAt;
     return this.accessToken;
@@ -194,7 +246,12 @@ export default class GDriveSyncPlugin extends Plugin {
       await this.saveSettings();
 
       const changes =
-        result.uploaded + result.downloaded + result.deletedLocal + result.deletedRemote + result.conflicts;
+        result.uploaded +
+        result.downloaded +
+        result.deletedLocal +
+        result.deletedRemote +
+        result.conflicts +
+        result.moved;
       if (result.errors.length) {
         console.error("[gdrive-sync] errors:", result.errors);
         new Notice(`Drive sync finished with ${result.errors.length} error(s). See the developer console.`);
@@ -204,6 +261,7 @@ export default class GDriveSyncPlugin extends Plugin {
           result.downloaded && `${result.downloaded} down`,
           result.deletedLocal + result.deletedRemote && `${result.deletedLocal + result.deletedRemote} deleted`,
           result.conflicts && `${result.conflicts} conflict(s) kept as copies`,
+          result.moved && `${result.moved} moved into Drive folders`,
         ].filter(Boolean);
         new Notice(`Drive sync done${parts.length ? `: ${parts.join(", ")}` : ""}.`);
       }
@@ -244,6 +302,13 @@ class GDriveSettingTab extends PluginSettingTab {
         .setName("Google account")
         .setDesc("Sign in to start syncing. A browser opens; after you approve, it sends you back here.")
         .addButton((b) => b.setButtonText("Sign in with Google").setCta().onClick(() => this.plugin.startLogin()));
+
+      let link = "";
+      new Setting(containerEl)
+        .setName("Paste sign-in link")
+        .setDesc("If the browser didn't bring you back here, copy the link from the sign-in page and paste it here.")
+        .addText((t) => t.setPlaceholder("obsidian://gdrive-sync-auth?code=…").onChange((v) => (link = v)))
+        .addButton((b) => b.setButtonText("Finish sign-in").onClick(() => this.plugin.finishLoginFromLink(link)));
     }
 
     new Setting(containerEl)
@@ -260,10 +325,34 @@ class GDriveSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Auth server URL")
-      .setDesc("Advanced. Only change this if you run your own auth server.")
+      .setName("Google client ID")
+      .setDesc("From your Google Cloud OAuth client (Web application).")
       .addText((t) =>
-        t.setValue(this.plugin.settings.serverUrl).onChange(async (v) => {
+        t
+          .setPlaceholder("xxxx.apps.googleusercontent.com")
+          .setValue(this.plugin.settings.clientId)
+          .onChange(async (v) => {
+            this.plugin.settings.clientId = v.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Google client secret")
+      .setDesc("Saved in this vault's plugin data file (.obsidian/plugins/gdrive-sync/data.json).")
+      .addText((t) => {
+        t.inputEl.type = "password";
+        t.setValue(this.plugin.settings.clientSecret).onChange(async (v) => {
+          this.plugin.settings.clientSecret = v.trim();
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Relay URL")
+      .setDesc("Where you deployed the relay (it serves /callback), e.g. https://relay.example.com.")
+      .addText((t) =>
+        t.setPlaceholder("https://relay.example.com").setValue(this.plugin.settings.serverUrl).onChange(async (v) => {
           this.plugin.settings.serverUrl = v.trim();
           await this.plugin.saveSettings();
         }),

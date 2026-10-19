@@ -1,5 +1,5 @@
 import { App, TFile, normalizePath } from "obsidian";
-import { Drive, RemoteFile } from "./drive";
+import { Drive, RemoteFile, TreeFile } from "./drive";
 
 /** What a file looked like on both sides after the last good sync. */
 export interface FileState {
@@ -18,6 +18,8 @@ export interface SyncResult {
   deletedLocal: number;
   deletedRemote: number;
   conflicts: number;
+  /** Files from older versions moved from the flat layout into real Drive folders. */
+  moved: number;
   errors: string[];
 }
 
@@ -39,7 +41,15 @@ function conflictPath(path: string): string {
   return `${base} (conflict ${stamp})${ext}`;
 }
 
+function splitPath(path: string): { dir: string; name: string } {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? { dir: "", name: path } : { dir: path.slice(0, slash), name: path.slice(slash + 1) };
+}
+
 export class Syncer {
+  /** Vault folder path -> Drive folder id. The empty path is the vault folder itself. */
+  private folders = new Map<string, string>();
+
   constructor(private app: App, private drive: Drive, private folderId: string) {}
 
   private async ensureParent(path: string): Promise<void> {
@@ -74,18 +84,55 @@ export class Syncer {
       deletedLocal: 0,
       deletedRemote: 0,
       conflicts: 0,
+      moved: 0,
       errors: [],
     };
 
     const local = new Map<string, TFile>();
     for (const f of this.app.vault.getFiles()) local.set(f.path, f);
 
-    const remote = new Map<string, RemoteFile>();
-    for (const r of await this.drive.listFiles(this.folderId)) {
-      const path = normalizePath(r.name);
+    const tree = await this.drive.listTree(this.folderId);
+    this.folders = tree.folders;
+
+    const remote = new Map<string, TreeFile>();
+    const losers: TreeFile[] = [];
+    for (const r of tree.files) {
+      const path = normalizePath(r.path);
       const seen = remote.get(path);
-      // Two devices may have uploaded the same new file at once. Keep the newest.
-      if (!seen || r.modifiedTime > seen.modifiedTime) remote.set(path, r);
+      // Two copies of one path (two devices, or an old flat upload next to a new one). Keep the newest.
+      if (!seen) {
+        remote.set(path, r);
+      } else if (r.modifiedTime > seen.modifiedTime) {
+        losers.push(seen);
+        remote.set(path, r);
+      } else {
+        losers.push(r);
+      }
+    }
+
+    // Older versions kept every file in one Drive folder, named by its full path. Put the files
+    // into real folders without re-uploading them, and bin the stale flat copies of duplicates.
+    for (const r of losers) {
+      if (!r.legacy) continue;
+      try {
+        await this.drive.trash(r.id);
+      } catch (err) {
+        result.errors.push(`${r.path}: ${(err as Error).message}`);
+      }
+    }
+    for (const [path, r] of remote) {
+      if (!r.legacy) continue;
+      try {
+        const { dir, name } = splitPath(path);
+        const parentId = await this.drive.ensureFolderPath(dir, this.folders);
+        await this.drive.move(r.id, name, r.parentId, parentId);
+        r.parentId = parentId;
+        r.name = name;
+        r.legacy = false;
+        result.moved++;
+      } catch (err) {
+        result.errors.push(`${path}: ${(err as Error).message}`);
+      }
     }
 
     // Safety net: if one side is suddenly empty, don't treat it as "everything was deleted".
@@ -110,7 +157,7 @@ export class Syncer {
   private async syncOne(
     path: string,
     L: TFile | undefined,
-    R: RemoteFile | undefined,
+    R: TreeFile | undefined,
     S: FileState | undefined,
     result: SyncResult,
   ): Promise<FileState | undefined> {
@@ -162,7 +209,9 @@ export class Syncer {
         result.deletedLocal++;
         return undefined;
       }
-      const up = await this.drive.create(this.folderId, path, await vault.readBinary(L));
+      const { dir, name } = splitPath(path);
+      const parentId = await this.drive.ensureFolderPath(dir, this.folders);
+      const up = await this.drive.create(parentId, name, await vault.readBinary(L));
       result.uploaded++;
       return this.record(L, up);
     }

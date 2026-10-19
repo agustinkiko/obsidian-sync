@@ -1,21 +1,22 @@
 # Obsidian Google Drive Sync
 
-Two parts:
+Sync your vault to a Google Drive folder. Two parts:
 
-- `plugin/`: the Obsidian plugin (desktop and mobile).
-- `server/`: a tiny auth server for your k3s cluster. It holds the Google client secret and stores nothing.
+- `plugin/`: the Obsidian plugin (desktop and mobile). It holds your Google client ID and secret and talks to Google directly.
+- `server/`: a tiny redirect relay you host on any Kubernetes cluster. It holds no secrets and stores nothing.
 
 Sign-in flow:
 
 ```
-Obsidian ──opens──> https://obsidian-sync.jericogustin.com/start
-                         └─> Google sign-in
-                               └─> https://obsidian-sync.jericogustin.com/callback
-                                     └─> obsidian://gdrive-sync-auth?code=...
-Obsidian ──POST /token──> server ──> Google ──> tokens back to Obsidian
+Obsidian ──opens──> Google sign-in (client ID from the plugin settings)
+                       └─> https://<your-relay>/callback        (relay on your cluster)
+                             └─> obsidian://gdrive-sync-auth?code=...
+Obsidian ──code + client secret──> Google token endpoint ──> tokens stored in Obsidian
 ```
 
-Files go to a Drive folder named `Obsidian - <vault name>`. Each file is stored with its full path as its name, for example `Notes/today.md`.
+Files go to a Drive folder named `Obsidian - <vault name>`. Your vault's folders become real Drive folders, so `Notes/today.md` is the file `today.md` inside the folder `Notes`. Files uploaded by older versions (one flat folder, with the full path as the file name) are moved into real folders on the next sync, without re-uploading them.
+
+Throughout this guide, `<your-relay>` is the public hostname you choose for the relay, for example `relay.example.com`.
 
 ---
 
@@ -30,35 +31,33 @@ Files go to a Drive folder named `Obsidian - <vault name>`. Each file is stored 
    - Audience: add your own Google account as a **test user**.
 4. **Credentials → Create credentials → OAuth client ID**:
    - Application type: **Web application**.
-   - Authorized redirect URI: `https://obsidian-sync.jericogustin.com/callback`
-   - Copy the **Client ID** and **Client secret**.
+   - Authorized redirect URI: `https://<your-relay>/callback`
+   - Copy the **Client ID** and **Client secret**. You will paste them into the Obsidian plugin settings in step 3.
 5. When it works, set the app to **In production** (Audience → Publish app). In testing mode, sign-ins expire after 7 days. `drive.file` is a non-sensitive scope, so Google does not require a review.
 
-## 2. Deploy the server on k3s
+## 2. Deploy the relay
 
-Point DNS for `obsidian-sync.jericogustin.com` at your k3s server first.
+Choose a hostname (`<your-relay>`) and point it at your cluster's ingress. Google requires HTTPS for the redirect URI, so terminate TLS at your edge (a CDN, tunnel, or cert-manager).
 
 ```bash
 cd server
-cat > secret.env <<'EOF'
-CLIENT_ID=paste-client-id-here
-CLIENT_SECRET=paste-client-secret-here
-EOF
 kubectl apply -k .
 ```
+
+This creates a namespace `obsidian-auth` with a Deployment, Service and a standard `Ingress`. The Ingress uses the placeholder host `relay.example.com` and the `traefik` ingress class (the k3s default). Before applying, change them in `server/k8s/ingress.yaml`, or set them in your own overlay so the repo stays untouched. Use `ingressClassName` for your controller if you don't run Traefik.
 
 Check it:
 
 ```bash
 kubectl -n obsidian-auth get pods
-curl https://obsidian-sync.jericogustin.com/healthz
+curl https://<your-relay>/healthz
 ```
 
 The last command should print `ok`.
 
-HTTPS: `server/k8s/ingress.yaml` uses cert-manager with a ClusterIssuer named `letsencrypt-prod`. If your issuer has another name, change that line. If you don't use cert-manager, delete the annotation and set up TLS in Traefik your own way. Google requires HTTPS.
+The relay has no secrets, so there is nothing to create first.
 
-To update the server code later: edit `server/server.js`, then run `kubectl apply -k .` again. The pod restarts by itself.
+To update the relay later: edit `server/server.js`, then run `kubectl apply -k .` again. The pod restarts by itself.
 
 ## 3. Build and install the plugin
 
@@ -74,7 +73,17 @@ Copy `main.js` and `manifest.json` into:
 <your vault>/.obsidian/plugins/gdrive-sync/
 ```
 
-Then in Obsidian: **Settings → Community plugins → enable "Google Drive Sync"**, then click **Sign in with Google**.
+Then in Obsidian:
+
+1. **Settings → Community plugins → enable "Google Drive Sync"**.
+2. Open the plugin's settings and fill in:
+   - **Relay URL**: `https://<your-relay>`
+   - **Google client ID** and **Google client secret** from step 1.
+3. Click **Sign in with Google**.
+
+If the browser doesn't switch back to Obsidian after you approve (Chrome often blocks or asks before opening other apps), click **Copy link** on the sign-in page. Then paste it into **Paste sign-in link** in the plugin settings and click **Finish sign-in**.
+
+The client secret is saved in `.obsidian/plugins/gdrive-sync/data.json` inside your vault. Anyone who can read that file can use the secret, so treat the vault folder as sensitive.
 
 Mobile: put the same two files in the same folder of the vault on your phone. Another way is to publish a GitHub release and install it with the BRAT plugin.
 
