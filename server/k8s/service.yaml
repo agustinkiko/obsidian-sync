@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: obsidian-auth
+spec:
+  selector:
+    app: obsidian-auth
+  ports:
+    - port: 80
+      targetPort: 8080
